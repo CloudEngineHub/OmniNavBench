@@ -24,6 +24,7 @@ from bench.utils.visualizer import Visualizer
 
 from ..policy.base import BasePolicy
 from .episode_runner import EpisodeRunner, EpisodeConfig, EpisodeResult
+from .runtime_limits import find_test_runtime_limits, test_runtime_limit_key
 from .termination import StuckCondition, TimeoutCondition, TerminationCondition
 from bench.configs.execution import ExecutionConfig
 from bench.execution.policy_modes import default_policy_mode_map
@@ -202,21 +203,34 @@ class BenchRunner:
         """
         start_time = time.monotonic()
 
-        # Load scenarios
-        scenarios = self._load_scenarios()
-        print(f"[BenchRunner] Loaded {len(scenarios)} scenarios")
+        # Keep the source JSON for every scenario so directory inputs can resolve
+        # per-episode metadata and can be loaded by EnvsetConfigLoader correctly.
+        scenario_refs = self._load_scenario_refs()
+        if self.config.sort_by_scene:
+            scenario_refs = sorted(
+                scenario_refs,
+                key=lambda ref: (
+                    ref.scenario.get("scene", {}).get("usd_path", "")
+                    or ref.scenario.get("scene", {}).get("asset_path", "")
+                ),
+            )
+        print(f"[BenchRunner] Loaded {len(scenario_refs)} scenarios")
 
         # Create output directory
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Run each scenario
-        for idx, scenario in enumerate(scenarios):
-            scenario_id = scenario.get("id", f"scenario_{idx}")
-            print(f"\n[BenchRunner] Running scenario {idx + 1}/{len(scenarios)}: {scenario_id}")
+        for idx, ref in enumerate(scenario_refs):
+            scenario = ref.scenario
+            scenario_id = ref.scenario_id
+            print(f"\n[BenchRunner] Running scenario {idx + 1}/{len(scenario_refs)}: {scenario_id}")
 
             try:
                 print("run_scenario")
-                result = self._run_scenario(scenario)
+                result = self._run_scenario(
+                    scenario,
+                    source_envset_path=ref.source_envset_path,
+                )
                 print("run_end")
                 try:
                     self._results.append(result)
@@ -301,7 +315,12 @@ class BenchRunner:
 
         return sorted(scenarios, key=get_scene_key)
 
-    def _run_scenario(self, scenario: Dict[str, Any]) -> EpisodeResult:
+    def _run_scenario(
+        self,
+        scenario: Dict[str, Any],
+        *,
+        source_envset_path: Optional[Path] = None,
+    ) -> EpisodeResult:
         """Run single scenario with fresh SimulationApp.
 
         This method handles the full lifecycle:
@@ -330,11 +349,12 @@ class BenchRunner:
 
         scenario_id = scenario.get("id", "unknown")
         robot_name = self._get_robot_name(scenario)
+        active_envset_path = Path(source_envset_path or self.config.envset_path)
 
         # Normalize envset file paths before scenario use.
         EnvsetConfigLoader.normalize_scenario_paths(scenario, self.config.scene_root)
         # Build episode config from scenario
-        episode_config = self._build_episode_config(scenario, source_envset_path=self.config.envset_path)
+        episode_config = self._build_episode_config(scenario, source_envset_path=active_envset_path)
         if episode_config is None:
             raise ValueError(f"Scenario '{scenario_id}' should be skipped (single task parser returned None)")
 
@@ -351,7 +371,7 @@ class BenchRunner:
         # Load and merge config
         bundle = EnvsetConfigLoader(
             config_path=self.config.uninav_config,
-            envset_path=self.config.envset_path,
+            envset_path=active_envset_path,
             scenario_id=scenario_id,
             scene_root=self.config.scene_root,
         ).load()
@@ -710,6 +730,7 @@ class BenchRunner:
         start_position = None
         expert_time_s: float = 0.0
         expert_frames: int = 0
+        max_wall_time_s: Optional[float] = None
         
         if not entries:
             raise ValueError(f"Scenario '{scenario_id}' has no robot entries in 'robots.entries'")
@@ -721,31 +742,55 @@ class BenchRunner:
             scaled = _scale_xyz(pos)
             start_position = (float(scaled[0]), float(scaled[1]), float(scaled[2]))
         
-        # Prefer canonical recording.gt_path; fall back to legacy rb_gt_waypoints for older envsets.
-        expert_waypoints = resolve_recording_waypoints(scenario, envset_path=source_envset_path)
-        if not expert_waypoints:
-            raise ValueError(
-                f"Scenario '{scenario_id}' is missing standard recording.gt_path and legacy rb_gt_waypoints. "
-                "This field is required for computing timeout limits."
-            )
-
-        last_waypoint = expert_waypoints[-1]
-        if not isinstance(last_waypoint, dict):
-            raise ValueError(
-                f"Scenario '{scenario_id}': last expert waypoint is not a valid dict"
-            )
-        
-        expert_time_s = float(last_waypoint.get("time_s", 0.0))
-        expert_frames = int(last_waypoint.get("frame", 0))
-        
-        if expert_time_s <= 0 and expert_frames <= 0:
-            raise ValueError(
-                f"Scenario '{scenario_id}': last waypoint has invalid time_s={expert_time_s} "
-                f"and frame={expert_frames}. At least one must be positive."
-            )
-        
         multiplier = self.config.timeout_multiplier
-        max_steps = int(expert_frames * multiplier) if expert_frames > 0 else 10000  # fallback
+
+        # Decide from the scenario content: any annotation that contains GT keeps
+        # the existing GT-derived behavior. Only a GT-free public test annotation
+        # falls back to the fixed limits published with the repository.
+        expert_waypoints = resolve_recording_waypoints(scenario, envset_path=source_envset_path)
+        if expert_waypoints:
+            last_waypoint = expert_waypoints[-1]
+            if not isinstance(last_waypoint, dict):
+                raise ValueError(
+                    f"Scenario '{scenario_id}': last expert waypoint is not a valid dict"
+                )
+
+            expert_time_s = float(last_waypoint.get("time_s", 0.0))
+            expert_frames = int(last_waypoint.get("frame", 0))
+
+            if expert_time_s <= 0 and expert_frames <= 0:
+                raise ValueError(
+                    f"Scenario '{scenario_id}': last waypoint has invalid time_s={expert_time_s} "
+                    f"and frame={expert_frames}. At least one must be positive."
+                )
+
+            max_steps = int(expert_frames * multiplier) if expert_frames > 0 else 10000  # fallback
+            if expert_time_s > 0:
+                max_wall_time_s = max(300.0, expert_time_s * multiplier * 5.0)
+            timeout_source = "ground_truth"
+        else:
+            runtime_limits = find_test_runtime_limits(source_envset_path, str(scenario_id))
+            if runtime_limits is None:
+                manifest_key = (
+                    test_runtime_limit_key(source_envset_path, str(scenario_id))
+                    if source_envset_path is not None
+                    else None
+                )
+                if manifest_key is not None:
+                    raise ValueError(
+                        f"Scenario '{scenario_id}' has no GT and no entry in the test runtime-limit "
+                        f"manifest for key '{manifest_key}'."
+                    )
+                raise ValueError(
+                    f"Scenario '{scenario_id}' is missing standard recording.gt_path and legacy "
+                    "rb_gt_waypoints. This field is required for computing timeout limits."
+                )
+
+            # These are final values generated with the benchmark's fixed test
+            # multiplier. Do not apply the CLI multiplier a second time.
+            max_steps = runtime_limits.max_steps
+            max_wall_time_s = runtime_limits.max_wall_time_s
+            timeout_source = "test_runtime_limits"
 
         extra: Dict[str, Any] = {}
 
@@ -806,6 +851,8 @@ class BenchRunner:
         extra["expert_time_s"] = expert_time_s
         extra["expert_frames"] = expert_frames
         extra["timeout_multiplier"] = multiplier
+        extra["max_wall_time_s"] = max_wall_time_s
+        extra["timeout_source"] = timeout_source
 
         return EpisodeConfig(
             scenario_id=scenario_id,
@@ -820,12 +867,19 @@ class BenchRunner:
     def _build_termination_conditions(self, config: EpisodeConfig) -> List[TerminationCondition]:
         """Build termination conditions for episode."""
         extra = config.extra or {}
-        expert_time_s = float(extra.get("expert_time_s", 0.0) or 0.0)
-        multiplier = float(extra.get("timeout_multiplier", self.config.timeout_multiplier) or self.config.timeout_multiplier)
-        wall_timeout_s = None
-        if expert_time_s > 0:
-            # Wall-clock guard is intentionally generous; step limit remains the benchmark timeout.
-            wall_timeout_s = max(300.0, expert_time_s * multiplier * 5.0)
+        wall_timeout_s = extra.get("max_wall_time_s")
+        if wall_timeout_s is not None:
+            wall_timeout_s = float(wall_timeout_s)
+        else:
+            # Backward compatibility for EpisodeConfig objects built outside BenchRunner.
+            expert_time_s = float(extra.get("expert_time_s", 0.0) or 0.0)
+            multiplier = float(
+                extra.get("timeout_multiplier", self.config.timeout_multiplier)
+                or self.config.timeout_multiplier
+            )
+            if expert_time_s > 0:
+                # Wall-clock guard is intentionally generous; step limit remains the benchmark timeout.
+                wall_timeout_s = max(300.0, expert_time_s * multiplier * 5.0)
 
         return [
             StuckCondition(duration_s=60.0, move_threshold_m=0.1),
@@ -1387,7 +1441,7 @@ class BenchRunner:
                 runner.warm_up(steps=self._CAMERA_LIGHT_WARMUP_STEPS, render=True, physics=True)
 
         # Build episode config
-        episode_config = self._build_episode_config(scenario, source_envset_path=self.config.envset_path)
+        episode_config = self._build_episode_config(scenario, source_envset_path=ref.source_envset_path)
         if episode_config is None:
             raise ValueError(f"Scenario '{scenario_id}' should be skipped (single task parser returned None)")
         self._log(f"[BenchRunner][{scenario_id}] Episode config:")
@@ -1939,4 +1993,3 @@ class BenchRunner:
         print(f"  Total Time: {result.total_time_s:.1f}s")
         print(f"  (scoring is offline — see bench/evaluator/offline_test.py)")
         print(f"  Results saved to: {self.config.output_dir}")
-

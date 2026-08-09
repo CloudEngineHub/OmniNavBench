@@ -132,6 +132,17 @@ OmniNavBench/
     └── train/...
 ```
 
+The sanitized test annotations do not contain private GT. Per-episode test timeout
+budgets are therefore published with the code in
+`bench/datasets/metadata/test_runtime_limits.json`. `BenchRunner` uses those fixed
+values for matching test annotations and keeps the existing GT-derived timeout
+logic for train and custom annotations. Detection is content-first: when GT is
+present, `--timeout-multiplier` behaves as before; only GT-free test annotations
+use the published final budgets (generated with the official `2.0` multiplier),
+so the CLI multiplier is not applied to those values a second time. A canonical
+SHA-256 of each public annotation is checked before its budget is used, preventing
+limits from a different dataset version from being applied silently.
+
 The expected asset root layout is:
 
 ```
@@ -252,6 +263,11 @@ For larger sweeps, two thin wrappers around `runBench.py` ship in the repo root.
 ```
 
 Selected flags: `--policy NAME` (default `forward`), `--robot h1,aliengo,carter` (comma-separated, defaults to all three), `--mode train|test` (default `test`), `--style original|concise|verbose|first_person` (default `original`), `--workers-per-gpu N` (default 4), `--num-gpus N` (default = autodetected), `--server-url URL`, `--skip-completed`.
+
+Batch runs keep trajectory recording enabled because offline and leaderboard
+scoring require the submitted per-step robot positions. When replacing results
+from an older batch run that omitted trajectories, use a fresh `--output-root`;
+otherwise existing episode JSON files may be skipped.
 
 `benchteststyle.sh` sweeps one robot across all four instruction styles via the `--omninavbench` shortcut:
 

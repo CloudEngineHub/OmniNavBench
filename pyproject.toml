@@ -24,6 +24,9 @@ dependencies = [
     "toml==0.10.*",
 ]
 
+[tool.setuptools.package-data]
+"bench.datasets" = ["metadata/*.json"]
+
 [tool.black]
 line-length = 120
 skip-string-normalization = true

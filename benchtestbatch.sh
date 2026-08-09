@@ -115,6 +115,8 @@ run_scene_task() {
   mkdir -p "$output_dir"
   echo "[Worker $worker_id] START $robot/$scene (GPU $gpu_id)"
 
+  # Keep trajectory recording enabled: offline and leaderboard scoring
+  # recompute metrics from the submitted per-step robot positions.
   # shellcheck disable=SC2046
   if ! CUDA_VISIBLE_DEVICES=$gpu_id python "$REPO_ROOT/runBench.py" \
         --config "$REPO_ROOT/$config_file" \
@@ -123,7 +125,6 @@ run_scene_task() {
         --policy "$POLICY" \
         $(build_server_url_args) \
         --headless \
-        --no-trajectory \
         > "$log_file" 2>&1; then
     echo "[Worker $worker_id] FAILED $robot/$scene"
     mv "$log_file" "${log_file}.failed"

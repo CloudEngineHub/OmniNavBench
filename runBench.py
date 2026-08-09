@@ -115,8 +115,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scenario", action="append", dest="scenarios", help="Scenario ID to run (repeatable).")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
-    parser.add_argument("--timeout-multiplier", type=float, default=2.0,
-                       help="Timeout multiplier based on expert path time/frames (default: 2.0)")
+    parser.add_argument(
+        "--timeout-multiplier",
+        type=float,
+        default=2.0,
+        help=(
+            "Timeout multiplier for GT-backed annotations (default: 2.0). "
+            "Official GT-free test annotations use their published fixed limits."
+        ),
+    )
     parser.add_argument("--success-threshold", type=float, default=2.0, help="Success distance (meters)")
     parser.add_argument("--policy", choices=["forward", "uninavid", "uninavid_waypoint", "uninavid_waypoint_points", "mtu3d", "poliformer", "navila", "omninav"], default="forward")
     parser.add_argument("--no-trajectory", action="store_true", help="Disable trajectory recording")
